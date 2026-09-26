@@ -7,7 +7,13 @@ from typing import Any
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.geometry import ReconstructionError, parse_segments, reconstruct
+from app.geometry import (
+    ReconstructionError,
+    parse_hole_payload,
+    parse_segments,
+    reconstruct,
+    reconstruct_with_hole,
+)
 
 app = FastAPI(title="Sheet-metal contour reconstruction", version="1.0.0")
 
@@ -39,3 +45,9 @@ def health() -> dict:
 def reconstruct_contour(payload: Any = Body(...)) -> dict:
     segments = parse_segments(payload)
     return reconstruct(segments)
+
+
+@app.post("/reconstruct_with_hole")
+def reconstruct_contour_with_hole(payload: Any = Body(...)) -> dict:
+    outer, hole = parse_hole_payload(payload)
+    return reconstruct_with_hole(outer, hole)
