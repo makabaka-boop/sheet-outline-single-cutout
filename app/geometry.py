@@ -1,9 +1,9 @@
-"""Pure integer-geometry reconstruction of a closed orthogonal outer contour.
+"""Pure integer-geometry reconstruction of closed orthogonal contours.
 
 No floating point is used anywhere: all predicates and all outputs
 (doubled area, perimeter) are exact integers.
 
-Pipeline (deterministic, order-sensitive):
+Single-loop pipeline (deterministic, order-sensitive):
 
 1. Request validation  -> 422 with a stable ``code`` + witness.
 2. Endpoint adjacency reconstruction:
@@ -13,6 +13,14 @@ Pipeline (deterministic, order-sensitive):
 3. Traversal from the lexicographically smallest vertex, normalised to
    clockwise (standard Cartesian orientation, shoelace sign), plus the
    integer shoelace doubled area and the perimeter.
+
+Two-loop pipeline (outer contour + one hole): each group runs the same
+validation and topology checks, then the hole must lie strictly inside
+the outer contour -- no shared boundary point at all
+(HOLE_INTERSECTS_OUTER) and one hole vertex strictly inside
+(HOLE_OUTSIDE_OUTER settles the only remaining ambiguity, by the Jordan
+curve theorem).  The outer loop is normalised clockwise, the hole
+counter-clockwise.
 """
 
 from __future__ import annotations
@@ -98,8 +106,55 @@ def parse_segments(payload: object) -> list[Segment]:
             f"expected {MIN_SEGMENTS}..{MAX_SEGMENTS} segments, got {len(raw)}",
             {"count": len(raw)},
         )
+    return _parse_segment_list(raw, set())
 
+
+def parse_outer_hole_segments(payload: object) -> tuple[list[Segment], list[Segment]]:
+    """Validate the two-loop payload ("outer" + "hole" segment arrays).
+
+    Each group goes through the exact same per-segment validation as a
+    single-loop request.  Segment ids must be unique across both groups
+    (the response reports edge ids of both loops) and the combined edge
+    count must stay within the usual limit.
+    """
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("outer"), list)
+        or not isinstance(payload.get("hole"), list)
+    ):
+        raise ReconstructionError(
+            "INVALID_PAYLOAD",
+            'request body must be an object with "outer" and "hole" segment arrays',
+        )
+    raw_outer: list = payload["outer"]
+    raw_hole: list = payload["hole"]
+    for group, raw in (("outer", raw_outer), ("hole", raw_hole)):
+        if not (MIN_SEGMENTS <= len(raw) <= MAX_SEGMENTS):
+            raise ReconstructionError(
+                "INVALID_SEGMENT_COUNT",
+                f"{group} loop: expected {MIN_SEGMENTS}..{MAX_SEGMENTS} segments, "
+                f"got {len(raw)}",
+                {"count": len(raw), "group": group},
+            )
+    total = len(raw_outer) + len(raw_hole)
+    if total > MAX_SEGMENTS:
+        raise ReconstructionError(
+            "INVALID_SEGMENT_COUNT",
+            f"expected at most {MAX_SEGMENTS} segments in total, got {total}",
+            {"count": total},
+        )
     seen_ids: set[str] = set()
+    outer = _parse_segment_list(raw_outer, seen_ids)
+    hole = _parse_segment_list(raw_hole, seen_ids)
+    return outer, hole
+
+
+def _parse_segment_list(raw: list, seen_ids: set[str]) -> list[Segment]:
+    """Per-segment validation shared by both request shapes.
+
+    ``seen_ids`` is threaded through by the caller so the two-loop entry
+    point enforces id uniqueness across the two groups.
+    """
     segments: list[Segment] = []
     for item in raw:
         seg_id = item.get("id") if isinstance(item, dict) else None
@@ -312,12 +367,14 @@ def _signed_doubled_area(vertices: list[tuple[int, int]]) -> int:
     return total
 
 
-def reconstruct(segments: list[Segment]) -> dict:
-    """Rebuild the closed contour from validated segments.
+def _build_loop(
+    segments: list[Segment],
+) -> tuple[list[tuple[int, int]], list[str], int, int]:
+    """Run the topology checks and trace the closed loop.
 
-    Returns ``vertices`` (clockwise, starting at the lexicographically
-    smallest vertex), the ``edge_ids`` travelled alongside, the integer
-    ``doubled_area`` from the shoelace formula and the ``perimeter``.
+    Returns the traced vertices, the edge ids travelled alongside, the
+    *signed* doubled area (orientation not yet normalised) and the
+    perimeter.
     """
     incidence: dict[tuple[int, int], list[Segment]] = {}
     for seg in segments:
@@ -330,19 +387,155 @@ def reconstruct(segments: list[Segment]) -> dict:
 
     vertices, edge_ids = _trace(segments, incidence)
     signed_area = _signed_doubled_area(vertices)
-    doubled_area = abs(signed_area)
-    if signed_area > 0:
-        # Counter-clockwise in standard Cartesian orientation: flip to
-        # clockwise while keeping the start vertex first.
-        vertices = [vertices[0]] + vertices[:0:-1]
-        edge_ids.reverse()
-
     perimeter = sum(
         abs(seg.x2 - seg.x1) + abs(seg.y2 - seg.y1) for seg in segments
     )
+    return vertices, edge_ids, signed_area, perimeter
+
+
+def _orient(
+    vertices: list[tuple[int, int]],
+    edge_ids: list[str],
+    signed_area: int,
+    counterclockwise: bool,
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Flip the traced loop unless it already has the wanted orientation.
+
+    The start vertex (lexicographically smallest) stays first.
+    """
+    if (signed_area > 0) != counterclockwise:
+        vertices = [vertices[0]] + vertices[:0:-1]
+        edge_ids = edge_ids[::-1]
+    return vertices, edge_ids
+
+
+def reconstruct(segments: list[Segment]) -> dict:
+    """Rebuild the closed contour from validated segments.
+
+    Returns ``vertices`` (clockwise, starting at the lexicographically
+    smallest vertex), the ``edge_ids`` travelled alongside, the integer
+    ``doubled_area`` from the shoelace formula and the ``perimeter``.
+    """
+    vertices, edge_ids, signed_area, perimeter = _build_loop(segments)
+    vertices, edge_ids = _orient(vertices, edge_ids, signed_area, counterclockwise=False)
     return {
         "vertices": [[x, y] for x, y in vertices],
         "edge_ids": edge_ids,
-        "doubled_area": doubled_area,
+        "doubled_area": abs(signed_area),
         "perimeter": perimeter,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hole placement (outer contour + one hole)
+# ---------------------------------------------------------------------------
+
+
+def _intervals_touch(a1: int, a2: int, b1: int, b2: int) -> bool:
+    """Closed 1-D intervals share at least one point."""
+    lo_a, hi_a = (a1, a2) if a1 < a2 else (a2, a1)
+    lo_b, hi_b = (b1, b2) if b1 < b2 else (b2, b1)
+    return max(lo_a, lo_b) <= min(hi_a, hi_b)
+
+
+def _boundaries_touch(s: Segment, t: Segment) -> bool:
+    """Any shared point between two closed axis-aligned segments.
+
+    Unlike the self-intersection precheck there is no adjacency exemption
+    here: an outer edge and a hole edge must be completely disjoint, even
+    a single shared endpoint is a violation.
+    """
+    s_horizontal = s.y1 == s.y2
+    t_horizontal = t.y1 == t.y2
+    if s_horizontal and t_horizontal:
+        return s.y1 == t.y1 and _intervals_touch(s.x1, s.x2, t.x1, t.x2)
+    if not s_horizontal and not t_horizontal:
+        return s.x1 == t.x1 and _intervals_touch(s.y1, s.y2, t.y1, t.y2)
+    return _segments_cross(s, t)  # inclusive H/V test: crossing or touching
+
+
+def _check_hole_clear_of_outer(outer: list[Segment], hole: list[Segment]) -> None:
+    """The two boundaries must not cross, overlap collinearly or touch."""
+    bad_ids: set[str] = set()
+    for s in outer:
+        for t in hole:
+            if _boundaries_touch(s, t):
+                bad_ids.add(s.seg_id)
+                bad_ids.add(t.seg_id)
+    if bad_ids:
+        culprit = min(bad_ids)
+        raise ReconstructionError(
+            "HOLE_INTERSECTS_OUTER",
+            "hole boundary crosses, overlaps or touches the outer contour "
+            f"(smallest id: {culprit!r})",
+            {"segment_id": culprit},
+        )
+
+
+def _point_strictly_inside(
+    point: tuple[int, int], vertices: list[tuple[int, int]]
+) -> bool:
+    """Even-odd ray casting (+x direction) on the traced vertex loop.
+
+    Only called for points known not to lie on the boundary, so the
+    half-open vertical-edge rule decides exactly.
+    """
+    px, py = point
+    crossings = 0
+    for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1]):
+        if y1 == y2:
+            continue  # horizontal edges never cross a horizontal ray
+        lo, hi = (y1, y2) if y1 < y2 else (y2, y1)
+        if lo <= py < hi and x1 > px:
+            crossings += 1
+    return crossings % 2 == 1
+
+
+def reconstruct_with_hole(
+    outer_segments: list[Segment], hole_segments: list[Segment]
+) -> dict:
+    """Rebuild an outer contour with one hole that must lie strictly inside.
+
+    Both loops are validated and traced on their own first; placement is a
+    separate concern checked afterwards.  A connected hole boundary that
+    shares no point with the outer boundary lies either wholly inside or
+    wholly outside it (Jordan curve theorem), so one strictly-inside
+    vertex settles containment -- testing only that vertex *without* the
+    disjointness precheck would be wrong for concave outer contours.
+
+    The outer loop is normalised clockwise, the hole counter-clockwise;
+    the response carries both loops plus the net doubled area and the
+    total cutting length.
+    """
+    o_vertices, o_edges, o_signed, o_perimeter = _build_loop(outer_segments)
+    h_vertices, h_edges, h_signed, h_perimeter = _build_loop(hole_segments)
+
+    _check_hole_clear_of_outer(outer_segments, hole_segments)
+    if not _point_strictly_inside(h_vertices[0], o_vertices):
+        culprit = min(seg.seg_id for seg in hole_segments)
+        raise ReconstructionError(
+            "HOLE_OUTSIDE_OUTER",
+            "hole loop does not lie inside the outer contour",
+            {"segment_id": culprit},
+        )
+
+    o_vertices, o_edges = _orient(o_vertices, o_edges, o_signed, counterclockwise=False)
+    h_vertices, h_edges = _orient(h_vertices, h_edges, h_signed, counterclockwise=True)
+    outer_area = abs(o_signed)
+    hole_area = abs(h_signed)
+    return {
+        "outer": {
+            "vertices": [[x, y] for x, y in o_vertices],
+            "edge_ids": o_edges,
+            "doubled_area": outer_area,
+            "perimeter": o_perimeter,
+        },
+        "hole": {
+            "vertices": [[x, y] for x, y in h_vertices],
+            "edge_ids": h_edges,
+            "doubled_area": hole_area,
+            "perimeter": h_perimeter,
+        },
+        "net_doubled_area": outer_area - hole_area,
+        "total_cut_length": o_perimeter + h_perimeter,
     }
